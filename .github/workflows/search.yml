@@ -1,0 +1,224 @@
+name: "02 - 🔍 جستجوی پیشرفته یوتیوب"
+
+on:
+  workflow_dispatch:
+    inputs:
+      search_query:
+        description: "📝 عبارت جستجو"
+        required: true
+        type: string
+      max_results:
+        description: "🔢 تعداد نتایج (۱ تا ۳۰۰)"
+        required: false
+        default: "50"
+        type: string
+      video_type:
+        description: "🎬 نوع ویدیو"
+        required: false
+        default: "any"
+        type: choice
+        options:
+          - any
+          - short
+          - long
+      sort_by:
+        description: "📊 مرتب‌سازی بر اساس"
+        required: false
+        default: "relevance"
+        type: choice
+        options:
+          - relevance
+          - date
+          - views
+      include_description:
+        description: "📄 تعداد کاراکتر توضیحات (۰ = حذف)"
+        required: false
+        default: "0"
+        type: string
+      output_format:
+        description: "📄 فرمت خروجی (مارک‌داون همیشه در README ذخیره می‌شود)"
+        required: false
+        default: "markdown"
+        type: choice
+        options:
+          - markdown
+          - json
+          - csv
+
+jobs:
+  search:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: write
+    steps:
+      - name: بررسی مخزن
+        uses: actions/checkout@v4
+
+      - name: نصب ابزارها
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y python3-pip jq
+          pip3 install --upgrade yt-dlp
+
+      - name: اجرای جستجو و ساخت README
+        id: search
+        run: |
+          QUERY="${{ github.event.inputs.search_query }}"
+          MAX="${{ github.event.inputs.max_results }}"
+          VID_TYPE="${{ github.event.inputs.video_type }}"
+          DESC_LIMIT="${{ github.event.inputs.include_description }}"
+          OUTPUT="${{ github.event.inputs.output_format }}"
+
+          if [ "$MAX" -gt 300 ]; then MAX=300; fi
+          if [ -z "$DESC_LIMIT" ]; then DESC_LIMIT=0; fi
+
+          # ساخت فیلتر مدت زمان
+          FILTER_ARGS=""
+          if [ "$VID_TYPE" = "short" ]; then
+            FILTER_ARGS="--match-filter 'duration < 300'"
+          elif [ "$VID_TYPE" = "long" ]; then
+            FILTER_ARGS="--match-filter 'duration > 600'"
+          fi
+
+          echo "🔍 در حال جستجوی '$QUERY' (حداکثر $MAX نتیجه) ..."
+
+          # دریافت اطلاعات به صورت JSON (هر خط یک شیء)
+          yt-dlp --flat-playlist --dump-json \
+            --playlist-end "$MAX" \
+            $FILTER_ARGS \
+            "ytsearch${MAX}:${QUERY}" > raw.json.tmp
+
+          # تبدیل به آرایه JSON معتبر
+          jq -s '.' raw.json.tmp > raw.json
+          rm raw.json.tmp
+
+          COUNT=$(jq 'length' raw.json)
+          echo "TOTAL_COUNT=$COUNT" >> $GITHUB_ENV
+
+          if [ "$COUNT" -eq 0 ]; then
+            echo "❌ هیچ ویدیویی یافت نشد."
+            exit 0
+          fi
+
+          # ایجاد پوشه نتایج
+          mkdir -p youtube-search
+
+          # اگر فرمت JSON یا CSV خواسته شده باشد، فایل مربوطه را ذخیره کن
+          if [ "$OUTPUT" = "json" ]; then
+            cp raw.json youtube-search/results.json
+          elif [ "$OUTPUT" = "csv" ]; then
+            echo "title,url,duration,views,uploader,upload_date,description,thumbnail" > youtube-search/results.csv
+            jq -r --arg desc "$DESC_LIMIT" '.[] | [
+              .title,
+              ("https://youtube.com/watch?v=" + .id),
+              (.duration // 0),
+              (.view_count // 0),
+              .uploader,
+              .upload_date,
+              (.description // "" | .[0:($desc | tonumber)]),
+              .thumbnail
+            ] | @csv' raw.json >> youtube-search/results.csv
+          fi
+
+          # --- ساخت README.md با جدول مارک‌داون ---
+          cat > youtube-search/README.md << EOF
+# 📺 نتایج جستجو: $QUERY
+
+**تعداد نتایج:** $COUNT  
+**نوع ویدیو:** $VID_TYPE  
+**تاریخ جستجو:** $(date '+%Y-%m-%d %H:%M:%S')
+
+| # | بندانگشتی | عنوان و توضیحات | کانال | مدت | بازدید | تاریخ |
+|---|-----------|----------------|-------|-----|--------|-------|
+EOF
+
+          # پردازش هر آیتم و اضافه کردن یک ردیف به جدول
+          jq -c '.[]' raw.json | while read -r item; do
+            id=$(echo "$item" | jq -r '.id')
+            title=$(echo "$item" | jq -r '.title')
+            uploader=$(echo "$item" | jq -r '.uploader')
+            duration=$(echo "$item" | jq -r '.duration // 0')
+            views=$(echo "$item" | jq -r '.view_count // 0')
+            upload_date=$(echo "$item" | jq -r '.upload_date // ""')
+            thumbnail=$(echo "$item" | jq -r '.thumbnail // ""')
+            description=$(echo "$item" | jq -r '.description // ""')
+
+            # فرمت مدت زمان (دقیقه:ثانیه)
+            if [ "$duration" -gt 0 ]; then
+              mins=$((duration / 60))
+              secs=$((duration % 60))
+              duration_str="${mins}:$(printf "%02d" $secs)"
+            else
+              duration_str="?"
+            fi
+
+            # فرمت بازدید
+            if [ "$views" -ge 1000000 ]; then
+              views_str="$((views / 1000000))M"
+            elif [ "$views" -ge 1000 ]; then
+              views_str="$((views / 1000))K"
+            else
+              views_str="$views"
+            fi
+
+            # فرمت تاریخ
+            if [[ "$upload_date" =~ ^([0-9]{4})([0-9]{2})([0-9]{2})$ ]]; then
+              date_str="${BASH_REMATCH[1]}/${BASH_REMATCH[2]}/${BASH_REMATCH[3]}"
+            else
+              date_str="?"
+            fi
+
+            # توضیحات کوتاه
+            if [ "$DESC_LIMIT" -gt 0 ] && [ -n "$description" ]; then
+              desc_short=$(echo "$description" | head -c "$DESC_LIMIT")
+              if [ "${#description}" -gt "$DESC_LIMIT" ]; then desc_short="${desc_short}..."; fi
+            else
+              desc_short=""
+            fi
+
+            # حذف کاراکترهای مزاحم از عنوان
+            title_clean=$(echo "$title" | sed 's/|//g')
+
+            # نوشتن ردیف در README (بدون شماره که بعداً اضافه می‌شود)
+            echo "| _placeholder_ | <img src=\"$thumbnail\" width=\"80\"> | **$title_clean**<br><small>$desc_short</small> | $uploader | $duration_str | $views_str | $date_str |" >> youtube-search/README.md
+          done
+
+          # شماره‌گذاری ردیف‌های جدول (جایگزینی _placeholder_ با شماره)
+          if [ -f youtube-search/README.md ]; then
+            lineno=1
+            temp_file=$(mktemp)
+            while IFS= read -r line; do
+              if [[ "$line" == *"_placeholder_"* ]]; then
+                echo "${line/_placeholder_/$lineno}" >> "$temp_file"
+                lineno=$((lineno + 1))
+              else
+                echo "$line" >> "$temp_file"
+              fi
+            done < youtube-search/README.md
+            mv "$temp_file" youtube-search/README.md
+          fi
+
+          echo "RESULT_FILE=youtube-search/README.md" >> $GITHUB_ENV
+          echo "✅ README ساخته شد."
+
+      - name: Commit نتایج به مخزن
+        run: |
+          git config user.name "github-actions"
+          git config user.email "github-actions@github.com"
+          git add youtube-search/
+          git diff --cached --quiet || git commit -m "Add YouTube search results for '${{ github.event.inputs.search_query }}' [skip ci]"
+          git push
+
+      - name: ذخیره به عنوان Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: youtube-search-results
+          path: youtube-search/
+          retention-days: 7
+
+      - name: نمایش خلاصه در GitHub Summary
+        run: |
+          echo "# 🔍 نتایج جستجو: ${{ github.event.inputs.search_query }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          cat youtube-search/README.md >> $GITHUB_STEP_SUMMARY
