@@ -73,7 +73,6 @@ jobs:
           if [ "$MAX" -gt 300 ]; then MAX=300; fi
           if [ -z "$DESC_LIMIT" ]; then DESC_LIMIT=0; fi
 
-          # ساخت فیلتر مدت زمان
           FILTER_ARGS=""
           if [ "$VID_TYPE" = "short" ]; then
             FILTER_ARGS="--match-filter 'duration < 300'"
@@ -83,13 +82,11 @@ jobs:
 
           echo "🔍 در حال جستجوی '$QUERY' (حداکثر $MAX نتیجه) ..."
 
-          # دریافت اطلاعات به صورت JSON (هر خط یک شیء)
           yt-dlp --flat-playlist --dump-json \
             --playlist-end "$MAX" \
             $FILTER_ARGS \
             "ytsearch${MAX}:${QUERY}" > raw.json.tmp
 
-          # تبدیل به آرایه JSON معتبر
           jq -s '.' raw.json.tmp > raw.json
           rm raw.json.tmp
 
@@ -101,10 +98,8 @@ jobs:
             exit 0
           fi
 
-          # ایجاد پوشه نتایج
           mkdir -p youtube-search
 
-          # اگر فرمت JSON یا CSV خواسته شده باشد، فایل مربوطه را ذخیره کن
           if [ "$OUTPUT" = "json" ]; then
             cp raw.json youtube-search/results.json
           elif [ "$OUTPUT" = "csv" ]; then
@@ -121,76 +116,51 @@ jobs:
             ] | @csv' raw.json >> youtube-search/results.csv
           fi
 
-          # --- ساخت README.md با جدول مارک‌داون ---
-          cat > youtube-search/README.md << EOF
-# 📺 نتایج جستجو: $QUERY
+          # ساخت README با استفاده از jq -r (بدون حلقه bash)
+          cat > youtube-search/README.md << 'EOF'
+# 📺 نتایج جستجو: QUERY_PLACEHOLDER
 
-**تعداد نتایج:** $COUNT  
-**نوع ویدیو:** $VID_TYPE  
-**تاریخ جستجو:** $(date '+%Y-%m-%d %H:%M:%S')
+**تعداد نتایج:** COUNT_PLACEHOLDER  
+**نوع ویدیو:** TYPE_PLACEHOLDER  
+**تاریخ جستجو:** DATE_PLACEHOLDER
 
 | # | بندانگشتی | عنوان و توضیحات | کانال | مدت | بازدید | تاریخ |
 |---|-----------|----------------|-------|-----|--------|-------|
 EOF
 
-          # پردازش هر آیتم و اضافه کردن یک ردیف به جدول
-          jq -c '.[]' raw.json | while read -r item; do
-            id=$(echo "$item" | jq -r '.id')
-            title=$(echo "$item" | jq -r '.title')
-            uploader=$(echo "$item" | jq -r '.uploader')
-            duration=$(echo "$item" | jq -r '.duration // 0')
-            views=$(echo "$item" | jq -r '.view_count // 0')
-            upload_date=$(echo "$item" | jq -r '.upload_date // ""')
-            thumbnail=$(echo "$item" | jq -r '.thumbnail // ""')
-            description=$(echo "$item" | jq -r '.description // ""')
+          # جایگزینی مقادیر در README
+          CURRENT_DATE=$(date '+%Y-%m-%d %H:%M:%S')
+          sed -i "s|QUERY_PLACEHOLDER|$QUERY|g" youtube-search/README.md
+          sed -i "s|COUNT_PLACEHOLDER|$COUNT|g" youtube-search/README.md
+          sed -i "s|TYPE_PLACEHOLDER|$VID_TYPE|g" youtube-search/README.md
+          sed -i "s|DATE_PLACEHOLDER|$CURRENT_DATE|g" youtube-search/README.md
 
-            # فرمت مدت زمان (دقیقه:ثانیه)
-            if [ "$duration" -gt 0 ]; then
-              mins=$((duration / 60))
-              secs=$((duration % 60))
-              duration_str="${mins}:$(printf "%02d" $secs)"
-            else
-              duration_str="?"
-            fi
+          # تولید ردیف‌های جدول با jq
+          jq -r --arg desc "$DESC_LIMIT" '
+            .[] | 
+            .duration_str = (if .duration then ((.duration/60)|floor|tostring) + ":" + ((.duration%60)|tostring| ("0" + .)[-2:]) else "?" end) |
+            .views_str = (if .view_count then
+              (if .view_count >= 1000000 then ((.view_count/1000000)|floor|tostring) + "M"
+               elif .view_count >= 1000 then ((.view_count/1000)|floor|tostring) + "K"
+               else .view_count|tostring end)
+              else "?" end) |
+            .date_str = (if .upload_date and (.upload_date|length)==8 then
+              .upload_date[0:4] + "/" + .upload_date[4:6] + "/" + .upload_date[6:8]
+              else "?" end) |
+            .desc_short = (if .description and ($desc|tonumber) > 0 then
+              .description[0:($desc|tonumber)] + (if (.description|length) > ($desc|tonumber) then "..." else "" end)
+              else "" end) |
+            .title_clean = (.title | gsub("\\|"; " ")) |
+            "| __NUM__ | <img src=\"" + .thumbnail + "\" width=\"80\"> | **" + .title_clean + "**<br><small>" + .desc_short + "</small> | " + .uploader + " | " + .duration_str + " | " + .views_str + " | " + .date_str + " |"
+          ' raw.json >> youtube-search/README.md
 
-            # فرمت بازدید
-            if [ "$views" -ge 1000000 ]; then
-              views_str="$((views / 1000000))M"
-            elif [ "$views" -ge 1000 ]; then
-              views_str="$((views / 1000))K"
-            else
-              views_str="$views"
-            fi
-
-            # فرمت تاریخ
-            if [[ "$upload_date" =~ ^([0-9]{4})([0-9]{2})([0-9]{2})$ ]]; then
-              date_str="${BASH_REMATCH[1]}/${BASH_REMATCH[2]}/${BASH_REMATCH[3]}"
-            else
-              date_str="?"
-            fi
-
-            # توضیحات کوتاه
-            if [ "$DESC_LIMIT" -gt 0 ] && [ -n "$description" ]; then
-              desc_short=$(echo "$description" | head -c "$DESC_LIMIT")
-              if [ "${#description}" -gt "$DESC_LIMIT" ]; then desc_short="${desc_short}..."; fi
-            else
-              desc_short=""
-            fi
-
-            # حذف کاراکترهای مزاحم از عنوان
-            title_clean=$(echo "$title" | sed 's/|//g')
-
-            # نوشتن ردیف در README (بدون شماره که بعداً اضافه می‌شود)
-            echo "| _placeholder_ | <img src=\"$thumbnail\" width=\"80\"> | **$title_clean**<br><small>$desc_short</small> | $uploader | $duration_str | $views_str | $date_str |" >> youtube-search/README.md
-          done
-
-          # شماره‌گذاری ردیف‌های جدول (جایگزینی _placeholder_ با شماره)
+          # شماره‌گذاری ردیف‌ها
           if [ -f youtube-search/README.md ]; then
             lineno=1
             temp_file=$(mktemp)
             while IFS= read -r line; do
-              if [[ "$line" == *"_placeholder_"* ]]; then
-                echo "${line/_placeholder_/$lineno}" >> "$temp_file"
+              if [[ "$line" == *"__NUM__"* ]]; then
+                echo "${line/__NUM__/$lineno}" >> "$temp_file"
                 lineno=$((lineno + 1))
               else
                 echo "$line" >> "$temp_file"
