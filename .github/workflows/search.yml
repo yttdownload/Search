@@ -1,19 +1,19 @@
-name: "02 - 🔍 جستجوی پیشرفته یوتیوب"
+name: "🔍 جستجوی پیشرفته یوتیوب"
 
 on:
   workflow_dispatch:
     inputs:
       search_query:
-        description: "📝 عبارت جستجو"
+        description: "عبارت جستجو"
         required: true
         type: string
       max_results:
-        description: "🔢 تعداد نتایج (۱ تا ۳۰۰)"
+        description: "تعداد نتایج (حداکثر ۳۰۰)"
         required: false
         default: "50"
         type: string
       video_type:
-        description: "🎬 نوع ویدیو"
+        description: "نوع ویدیو"
         required: false
         default: "any"
         type: choice
@@ -22,7 +22,7 @@ on:
           - short
           - long
       sort_by:
-        description: "📊 مرتب‌سازی بر اساس"
+        description: "مرتب‌سازی"
         required: false
         default: "relevance"
         type: choice
@@ -31,12 +31,12 @@ on:
           - date
           - views
       include_description:
-        description: "📄 تعداد کاراکتر توضیحات (۰ = حذف)"
+        description: "تعداد کاراکتر توضیحات (۰=ندارد)"
         required: false
         default: "0"
         type: string
       output_format:
-        description: "📄 فرمت خروجی (مارک‌داون همیشه در README ذخیره می‌شود)"
+        description: "فرمت خروجی (علاوه بر README)"
         required: false
         default: "markdown"
         type: choice
@@ -58,119 +58,172 @@ jobs:
       - name: نصب ابزارها
         run: |
           sudo apt-get update
-          sudo apt-get install -y python3-pip jq
+          sudo apt-get install -y python3-pip
           pip3 install --upgrade yt-dlp
 
-      - name: اجرای جستجو و ساخت README
+      - name: اجرای جستجو با پایتون
         id: search
         run: |
-          QUERY="${{ github.event.inputs.search_query }}"
-          MAX="${{ github.event.inputs.max_results }}"
-          VID_TYPE="${{ github.event.inputs.video_type }}"
-          DESC_LIMIT="${{ github.event.inputs.include_description }}"
-          OUTPUT="${{ github.event.inputs.output_format }}"
+          python3 << 'EOF'
+          import json
+          import subprocess
+          import sys
+          import os
+          from datetime import datetime
 
-          if [ "$MAX" -gt 300 ]; then MAX=300; fi
-          if [ -z "$DESC_LIMIT" ]; then DESC_LIMIT=0; fi
+          # دریافت ورودی‌ها از environment variables
+          query = os.environ.get('INPUT_SEARCH_QUERY', '')
+          max_results = int(os.environ.get('INPUT_MAX_RESULTS', '50'))
+          video_type = os.environ.get('INPUT_VIDEO_TYPE', 'any')
+          sort_by = os.environ.get('INPUT_SORT_BY', 'relevance')
+          desc_limit = int(os.environ.get('INPUT_INCLUDE_DESCRIPTION', '0'))
+          output_format = os.environ.get('INPUT_OUTPUT_FORMAT', 'markdown')
 
-          FILTER_ARGS=""
-          if [ "$VID_TYPE" = "short" ]; then
-            FILTER_ARGS="--match-filter 'duration < 300'"
-          elif [ "$VID_TYPE" = "long" ]; then
-            FILTER_ARGS="--match-filter 'duration > 600'"
-          fi
+          if max_results > 300:
+              max_results = 300
 
-          echo "🔍 در حال جستجوی '$QUERY' (حداکثر $MAX نتیجه) ..."
+          # ساخت آرگومان‌های yt-dlp
+          yt_args = [
+              'yt-dlp', '--flat-playlist', '--dump-json',
+              '--playlist-end', str(max_results),
+              f'ytsearch{max_results}:{query}'
+          ]
 
-          yt-dlp --flat-playlist --dump-json \
-            --playlist-end "$MAX" \
-            $FILTER_ARGS \
-            "ytsearch${MAX}:${QUERY}" > raw.json.tmp
+          # فیلتر مدت زمان
+          if video_type == 'short':
+              yt_args.extend(['--match-filter', 'duration < 300'])
+          elif video_type == 'long':
+              yt_args.extend(['--match-filter', 'duration > 600'])
 
-          jq -s '.' raw.json.tmp > raw.json
-          rm raw.json.tmp
+          # مرتب‌سازی (در حد ممکن، yt-dlp مستقیماً پشتیبانی نمی‌کند، ولی بعداً در پایتون انجام می‌شود)
+          # فعلاً فقط داده را می‌گیریم، بعداً sort می‌کنیم.
 
-          COUNT=$(jq 'length' raw.json)
-          echo "TOTAL_COUNT=$COUNT" >> $GITHUB_ENV
+          print(f"🔄 در حال جستجوی '{query}' (حداکثر {max_results} نتیجه)...")
+          result = subprocess.run(yt_args, capture_output=True, text=True)
+          if result.returncode != 0:
+              print("❌ خطا در اجرای yt-dlp")
+              print(result.stderr)
+              sys.exit(1)
 
-          if [ "$COUNT" -eq 0 ]; then
-            echo "❌ هیچ ویدیویی یافت نشد."
-            exit 0
-          fi
+          # هر خط یک JSON شیء است
+          videos = []
+          for line in result.stdout.strip().split('\n'):
+              if not line:
+                  continue
+              try:
+                  video = json.loads(line)
+                  videos.append(video)
+              except:
+                  pass
 
-          mkdir -p youtube-search
+          count = len(videos)
+          print(f"✅ تعداد نتایج: {count}")
 
-          if [ "$OUTPUT" = "json" ]; then
-            cp raw.json youtube-search/results.json
-          elif [ "$OUTPUT" = "csv" ]; then
-            echo "title,url,duration,views,uploader,upload_date,description,thumbnail" > youtube-search/results.csv
-            jq -r --arg desc "$DESC_LIMIT" '.[] | [
-              .title,
-              ("https://youtube.com/watch?v=" + .id),
-              (.duration // 0),
-              (.view_count // 0),
-              .uploader,
-              .upload_date,
-              (.description // "" | .[0:($desc | tonumber)]),
-              .thumbnail
-            ] | @csv' raw.json >> youtube-search/results.csv
-          fi
+          if count == 0:
+              print("❌ هیچ ویدیویی یافت نشد.")
+              sys.exit(0)
 
-          # ساخت README با استفاده از jq -r (بدون حلقه bash)
-          cat > youtube-search/README.md << 'EOF'
-# 📺 نتایج جستجو: QUERY_PLACEHOLDER
+          # مرتب‌سازی بر اساس ورودی (فقط date و views)
+          if sort_by == 'date':
+              videos.sort(key=lambda x: x.get('upload_date', ''), reverse=True)
+          elif sort_by == 'views':
+              videos.sort(key=lambda x: x.get('view_count', 0), reverse=True)
+          # relevance ترتیب پیش‌فرض yt-dlp را حفظ می‌کند
 
-**تعداد نتایج:** COUNT_PLACEHOLDER  
-**نوع ویدیو:** TYPE_PLACEHOLDER  
-**تاریخ جستجو:** DATE_PLACEHOLDER
+          # ذخیره خروجی json یا csv در صورت نیاز
+          os.makedirs('youtube-search', exist_ok=True)
 
-| # | بندانگشتی | عنوان و توضیحات | کانال | مدت | بازدید | تاریخ |
-|---|-----------|----------------|-------|-----|--------|-------|
-EOF
+          if output_format == 'json':
+              with open('youtube-search/results.json', 'w', encoding='utf-8') as f:
+                  json.dump(videos, f, indent=2, ensure_ascii=False)
+          elif output_format == 'csv':
+              import csv
+              with open('youtube-search/results.csv', 'w', newline='', encoding='utf-8') as f:
+                  writer = csv.writer(f)
+                  writer.writerow(['title', 'url', 'duration', 'views', 'uploader', 'upload_date', 'description', 'thumbnail'])
+                  for v in videos:
+                      writer.writerow([
+                          v.get('title', ''),
+                          f"https://youtube.com/watch?v={v.get('id', '')}",
+                          v.get('duration', 0),
+                          v.get('view_count', 0),
+                          v.get('uploader', ''),
+                          v.get('upload_date', ''),
+                          v.get('description', '')[:desc_limit] if desc_limit else '',
+                          v.get('thumbnail', '')
+                      ])
 
-          # جایگزینی مقادیر در README
-          CURRENT_DATE=$(date '+%Y-%m-%d %H:%M:%S')
-          sed -i "s|QUERY_PLACEHOLDER|$QUERY|g" youtube-search/README.md
-          sed -i "s|COUNT_PLACEHOLDER|$COUNT|g" youtube-search/README.md
-          sed -i "s|TYPE_PLACEHOLDER|$VID_TYPE|g" youtube-search/README.md
-          sed -i "s|DATE_PLACEHOLDER|$CURRENT_DATE|g" youtube-search/README.md
+          # ساخت README.md با جدول مارک‌داون
+          md_lines = []
+          md_lines.append(f"# 📺 نتایج جستجو: {query}\n")
+          md_lines.append(f"**تعداد نتایج:** {count}")
+          md_lines.append(f"**نوع ویدیو:** {video_type}")
+          md_lines.append(f"**تاریخ جستجو:** {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+          md_lines.append("| # | بندانگشتی | عنوان و توضیحات | کانال | مدت | بازدید | تاریخ |")
+          md_lines.append("|---|-----------|----------------|-------|-----|--------|-------|")
 
-          # تولید ردیف‌های جدول با jq
-          jq -r --arg desc "$DESC_LIMIT" '
-            .[] | 
-            .duration_str = (if .duration then ((.duration/60)|floor|tostring) + ":" + ((.duration%60)|tostring| ("0" + .)[-2:]) else "?" end) |
-            .views_str = (if .view_count then
-              (if .view_count >= 1000000 then ((.view_count/1000000)|floor|tostring) + "M"
-               elif .view_count >= 1000 then ((.view_count/1000)|floor|tostring) + "K"
-               else .view_count|tostring end)
-              else "?" end) |
-            .date_str = (if .upload_date and (.upload_date|length)==8 then
-              .upload_date[0:4] + "/" + .upload_date[4:6] + "/" + .upload_date[6:8]
-              else "?" end) |
-            .desc_short = (if .description and ($desc|tonumber) > 0 then
-              .description[0:($desc|tonumber)] + (if (.description|length) > ($desc|tonumber) then "..." else "" end)
-              else "" end) |
-            .title_clean = (.title | gsub("\\|"; " ")) |
-            "| __NUM__ | <img src=\"" + .thumbnail + "\" width=\"80\"> | **" + .title_clean + "**<br><small>" + .desc_short + "</small> | " + .uploader + " | " + .duration_str + " | " + .views_str + " | " + .date_str + " |"
-          ' raw.json >> youtube-search/README.md
+          for idx, v in enumerate(videos, 1):
+              vid = v.get('id', '')
+              title = v.get('title', '').replace('|', ' ')
+              uploader = v.get('uploader', '?')
+              duration = v.get('duration', 0)
+              views = v.get('view_count', 0)
+              upload_date = v.get('upload_date', '')
+              thumbnail = v.get('thumbnail', '')
+              description = v.get('description', '')
 
-          # شماره‌گذاری ردیف‌ها
-          if [ -f youtube-search/README.md ]; then
-            lineno=1
-            temp_file=$(mktemp)
-            while IFS= read -r line; do
-              if [[ "$line" == *"__NUM__"* ]]; then
-                echo "${line/__NUM__/$lineno}" >> "$temp_file"
-                lineno=$((lineno + 1))
-              else
-                echo "$line" >> "$temp_file"
-              fi
-            done < youtube-search/README.md
-            mv "$temp_file" youtube-search/README.md
-          fi
+              # مدت زمان
+              if duration and duration > 0:
+                  mins = duration // 60
+                  secs = duration % 60
+                  duration_str = f"{mins}:{secs:02d}"
+              else:
+                  duration_str = "?"
 
-          echo "RESULT_FILE=youtube-search/README.md" >> $GITHUB_ENV
-          echo "✅ README ساخته شد."
+              # بازدید
+              if views:
+                  if views >= 1_000_000:
+                      views_str = f"{views // 1_000_000}M"
+                  elif views >= 1_000:
+                      views_str = f"{views // 1_000}K"
+                  else:
+                      views_str = str(views)
+              else:
+                  views_str = "?"
+
+              # تاریخ
+              if upload_date and len(upload_date) == 8:
+                  date_str = f"{upload_date[:4]}/{upload_date[4:6]}/{upload_date[6:8]}"
+              else:
+                  date_str = "?"
+
+              # توضیحات کوتاه
+              if desc_limit > 0 and description:
+                  desc_short = description[:desc_limit]
+                  if len(description) > desc_limit:
+                      desc_short += "..."
+              else:
+                  desc_short = ""
+
+              title_clean = title.replace('|', ' ')
+              md_lines.append(
+                  f"| {idx} | <img src=\"{thumbnail}\" width=\"80\"> | **{title_clean}**<br><small>{desc_short}</small> | {uploader} | {duration_str} | {views_str} | {date_str} |"
+              )
+
+          with open('youtube-search/README.md', 'w', encoding='utf-8') as f:
+              f.write("\n".join(md_lines))
+
+          print("✅ README ساخته شد.")
+          with open('count.txt', 'w') as f:
+              f.write(str(count))
+          EOF
+        env:
+          INPUT_SEARCH_QUERY: ${{ github.event.inputs.search_query }}
+          INPUT_MAX_RESULTS: ${{ github.event.inputs.max_results }}
+          INPUT_VIDEO_TYPE: ${{ github.event.inputs.video_type }}
+          INPUT_SORT_BY: ${{ github.event.inputs.sort_by }}
+          INPUT_INCLUDE_DESCRIPTION: ${{ github.event.inputs.include_description }}
+          INPUT_OUTPUT_FORMAT: ${{ github.event.inputs.output_format }}
 
       - name: Commit نتایج به مخزن
         run: |
